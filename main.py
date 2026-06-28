@@ -1,16 +1,17 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional
-from database import get_db, engine, Base
-import crud
-from schemas import (
+from typing import Optional, List
+from app.database import get_db, engine, Base
+from app import crud
+from app.schemas import (
     UserCreate, UserUpdate, UserResponse,
     LoginRequest, LoginResponse,
     AdvertisementCreate, AdvertisementUpdate, AdvertisementResponse
 )
-from auth import create_token
-from dependencies import get_current_user, require_admin
-from models import User
+from app.auth import verify_password, create_token
+from app.dependencies import get_current_user, get_current_user_optional, require_admin
+from app.models import User
+from app.rbac import has_permission, can_manage_user, can_manage_advertisement
 
 app = FastAPI(title="Advertisement Service", version="2.0.0")
 
@@ -18,11 +19,14 @@ app = FastAPI(title="Advertisement Service", version="2.0.0")
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    
+    async with get_db() as db:
+        await crud.create_default_roles(db)
 
 @app.post("/login", response_model=LoginResponse)
 async def login(login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
     user = await crud.get_user_by_username(db, login_data.username)
-    if not user or user.password != login_data.password:
+    if not user or not verify_password(login_data.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password"
@@ -32,18 +36,52 @@ async def login(login_data: LoginRequest, db: AsyncSession = Depends(get_db)):
     return LoginResponse(access_token=access_token)
 
 @app.post("/user", response_model=UserResponse, status_code=201)
-async def create_user(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
+async def create_user(
+    user_data: UserCreate,
+    db: AsyncSession = Depends(get_db)
+):
     existing_user = await crud.get_user_by_username(db, user_data.username)
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already exists")
+
+    if "admin" in user_data.roles:
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin can create users with admin role"
+        )
+    
     return await crud.create_user(db, user_data)
 
+@app.get("/user", response_model=list[UserResponse])
+async def get_all_users(
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    users = await crud.get_all_users(db)
+    return [UserResponse(
+        id=user.id,
+        username=user.username,
+        roles=[role.name for role in user.roles],
+        created_at=user.created_at
+    ) for user in users]
+
 @app.get("/user/{user_id}", response_model=UserResponse)
-async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
+async def get_user(
+    user_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+
     user = await crud.get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    return user
+    
+    return UserResponse(
+        id=user.id,
+        username=user.username,
+        roles=[role.name for role in user.roles],
+        created_at=user.created_at
+    )
 
 @app.patch("/user/{user_id}", response_model=UserResponse)
 async def update_user(
@@ -52,16 +90,22 @@ async def update_user(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    if current_user.id != user_id and current_user.group != "admin":
+
+    if not can_manage_user(current_user, user_id):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    
-    if user_data.group is not None and current_user.group != "admin":
-        user_data.group = None
+    if user_data.roles is not None and not has_permission(current_user, "user:change_role"):
+        raise HTTPException(status_code=403, detail="Only admin can change roles")
     
     user = await crud.update_user(db, user_id, user_data)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    return user
+    
+    return UserResponse(
+        id=user.id,
+        username=user.username,
+        roles=[role.name for role in user.roles],
+        created_at=user.created_at
+    )
 
 @app.delete("/user/{user_id}")
 async def delete_user(
@@ -69,7 +113,8 @@ async def delete_user(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    if current_user.id != user_id and current_user.group != "admin":
+    """Удаление пользователя (только свои данные или admin)"""
+    if not can_manage_user(current_user, user_id):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     
     deleted = await crud.delete_user(db, user_id)
@@ -125,7 +170,7 @@ async def update_advertisement(
     if not ad:
         raise HTTPException(status_code=404, detail="Advertisement not found")
     
-    if ad.author_id != current_user.id and current_user.group != "admin":
+    if not can_manage_advertisement(current_user, ad.author_id):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     
     updated = await crud.update_advertisement(db, advertisement_id, ad_data)
@@ -141,7 +186,7 @@ async def delete_advertisement(
     if not ad:
         raise HTTPException(status_code=404, detail="Advertisement not found")
     
-    if ad.author_id != current_user.id and current_user.group != "admin":
+    if not can_manage_advertisement(current_user, ad.author_id):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     
     deleted = await crud.delete_advertisement(db, advertisement_id)
