@@ -15,6 +15,7 @@ ROLE_PERMISSIONS = {
     ]
 }
 
+
 def has_permission(user: User, permission: str) -> bool:
     if not user or not user.roles:
         return False
